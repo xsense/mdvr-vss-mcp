@@ -12,9 +12,11 @@ and/or environment variables. No tool ever returns a credential.
 
 ## Run
 
+The package has two bins, so name the one to run with `-p <package> <bin>`.
+
 ```
-npx -y github:xsense/mdvr-vss-mcp                          # howen-vss-mcp
-npx -y -p github:xsense/mdvr-vss-mcp meitrack-ms03-mcp     # meitrack-ms03-mcp
+npx -y -p github:xsense/mdvr-vss-mcp howen-vss-mcp
+npx -y -p github:xsense/mdvr-vss-mcp meitrack-ms03-mcp
 ```
 
 Example MCP config:
@@ -24,7 +26,7 @@ Example MCP config:
   "mcpServers": {
     "howen-vss-mcp": {
       "command": "npx",
-      "args": ["-y", "github:xsense/mdvr-vss-mcp"],
+      "args": ["-y", "-p", "github:xsense/mdvr-vss-mcp", "howen-vss-mcp"],
       "env": { "HOWEN_VSS_DB_URI": "postgresql://reader:***@db.example.com:5432/app?sslmode=require" }
     },
     "meitrack-ms03-mcp": {
