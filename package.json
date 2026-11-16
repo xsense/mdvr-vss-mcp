@@ -1,0 +1,29 @@
+{
+  "name": "mdvr-vss-mcp",
+  "version": "0.4.0",
+  "description": "MCP servers (stdio) for MDVR platforms: Howen VSS and Meitrack MS03. Servers and credentials from a database or env.",
+  "type": "module",
+  "bin": {
+    "howen-vss-mcp": "howen-vss-mcp.mjs",
+    "meitrack-ms03-mcp": "meitrack-ms03-mcp.mjs"
+  },
+  "files": [
+    "howen-vss-mcp.mjs",
+    "meitrack-ms03-mcp.mjs"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "pg": "^8.13.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "private": true,
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xsense/mdvr-vss-mcp.git"
+  }
+}
