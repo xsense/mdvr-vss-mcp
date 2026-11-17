@@ -1,6 +1,6 @@
 {
   "name": "mdvr-vss-mcp",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "MCP servers (stdio) for MDVR platforms: Howen VSS and Meitrack MS03. Servers and credentials from a database or env.",
   "type": "module",
   "bin": {

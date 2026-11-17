@@ -88,6 +88,7 @@ Read tools:
 - `vss_list_fleets`
 - `vss_find_device`
 - `vss_device_status`
+- `vss_alarm_history`: bounded Alarm Record history, with explicit storage alarm levels when present.
 - `vss_get_device_setting`
 
 Write tools (only when `HOWEN_VSS_ALLOW_WRITE=1`, each call needs `confirm=true`):
@@ -132,3 +133,35 @@ npm install && npm test
 ```
 
 Tests use local fake servers only.
+
+## Howen Alarm Record history
+
+Call `vss_alarm_history` with one device number and a local UTC+7 time range:
+
+```json
+{"deviceID":"847053273528","cluster":"main","start":"2026-11-17 00:00:00","end":"2026-11-17 23:59:59","page_size":50,"page":1}
+```
+
+The range is limited to 31 days and a page to 100 rows. Follow `next_page` until null
+before describing a result as complete. Leave `alarm_types` empty for all types;
+when known, pass comma-separated numeric VSS alarm codes. No storage alarm code is assumed.
+
+The implementation follows the deployed VSS web client's Alarm Record query:
+`POST /vss/alarm/findAllByTime.action`, with `deviceGuid`, `deviceID`,
+`beginTime`, `endTime`, `alarmType`, `pageNum`, and `pageCount`.
+Source inspected on 2026-11-17:
+[API wrapper](https://howen.xsense.co.th/vss/assets/js/api-alarm-record.BpawIo2W.js),
+[Alarm Record UI](https://howen.xsense.co.th/vss/assets/js/alarm-record.g7G_oSuj.js).
+
+Results retain `alarmvalue` as `detail` and return explicit storage levels only for text
+of the form `NO:sd1 ; State:L3_Disk invalid block: ...`. That known description is
+mapped to `st=7` using the user-provided Storage abnormal table (2026-11-17; no source URL).
+Other descriptions retain their text and level without guessing a numeric status.
+Telemetry `storage.status` is not classified as an alarm code. L1/L2/L3 do not by
+themselves establish recording loss; check recorded files separately. Historical alarms
+also do not establish whether a fault is still active or has recovered.
+Driver and operator identity fields are excluded from the selected output fields.
+
+This tool only reads history; it does not acknowledge alarms, format cards or alter devices.
+Local tests use a fake server. A deployment must additionally verify the response shape
+and an actual alarm on the target VSS version before claiming live verification.

@@ -16,7 +16,7 @@
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline";
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const PREFIX = "HOWEN_VSS";
 // CLUSTERS / ORDER are mutated in place on reload so tool schemas that reference ORDER stay current.
 const CLUSTERS = {};
@@ -229,6 +229,31 @@ async function locate(deviceID, cluster) {
   return hits[0];
 }
 
+// Alarm Record fields and endpoint verified against the deployed VSS web client.
+// Only an explicit NO:<medium>; State:Lx_... alarm text supplies a storage level.
+// Telemetry storage.status and unrelated numeric st fields are never classified.
+export function storageAlarmText(value) {
+  if (typeof value !== "string") return null;
+  const match = value.match(/NO:\s*((?:sd|hdd)\d+)\s*;\s*State:\s*(L[123])[_\s]+([^;]+)/i);
+  if (!match) return null;
+  const description = match[3].trim();
+  const invalidBlock = match[2].toUpperCase() === "L3" && /^Disk invalid block(?::|$)/i.test(description);
+  return { medium: match[1].toLowerCase(), level: match[2].toUpperCase(), description,
+    ...(invalidBlock ? { st: 7 } : {}),
+    recording_impact: "Not established by this alarm text; verify recorded files." };
+}
+
+function alarmRange(start, end) {
+  const parse = value => {
+    if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value)) throw new Error("times must be YYYY-MM-DD HH:mm:ss (UTC+7)");
+    const date = new Date(value.replace(" ", "T") + "Z");
+    if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 19).replace("T", " ") !== value) throw new Error("invalid calendar time");
+    return date.getTime();
+  };
+  const a = parse(start), b = parse(end);
+  if (a > b || b - a > 31 * 86400000) throw new Error("start must be <= end and range must be at most 31 days");
+}
+
 const clusterProp = { type: "string", enum: ORDER, description: "VSS cluster. Omit to search all configured clusters." };
 const devProp = { type: "string", description: "Howen device number (deviceno), e.g. 001234567890" };
 
@@ -336,6 +361,47 @@ const TOOLS = [
       const res = check(k, await api(k, "/vss/vehicle/getVehicleSetting.action", { deviceID: String(deviceID), settingPara, lang: "en" }), "getVehicleSetting");
       return { cluster: k, deviceID: String(deviceID), settings: res.data };
     },
+  },
+  {
+    name: "vss_alarm_history",
+    description: "Read Alarm Record history, including Storage abnormal text. Times are UTC+7. Returns one bounded page and total_count; follow next_page to complete a search. Storage L levels come only from explicit alarm text, never telemetry storage.status. Historical alarms do not prove a current fault. No alarm acknowledgement or device changes.",
+    inputSchema: { type: "object", properties: {
+      deviceID: devProp, cluster: clusterProp,
+      start: { type: "string", description: "Start UTC+7, YYYY-MM-DD HH:mm:ss" },
+      end: { type: "string", description: "End UTC+7, YYYY-MM-DD HH:mm:ss; maximum range 31 days" },
+      alarm_types: { type: "string", description: "Optional comma-separated numeric VSS alarm types; omit for all types" },
+      page: { type: "integer", minimum: 1, default: 1 },
+      page_size: { type: "integer", minimum: 1, maximum: 100, default: 50 }
+    }, required: ["deviceID", "start", "end"] },
+    readOnly: true,
+    async run({ deviceID, cluster, start, end, alarm_types = "", page = 1, page_size = 50 }) {
+      if (typeof deviceID !== "string" || !/^\d+$/.test(deviceID)) throw new Error("deviceID must be one numeric device number");
+      alarmRange(start, end);
+      if (!Number.isInteger(page) || page < 1 || !Number.isInteger(page_size) || page_size < 1 || page_size > 100) throw new Error("invalid pagination");
+      if (typeof alarm_types !== "string" || (alarm_types && !/^\d+(,\d+)*$/.test(alarm_types))) throw new Error("alarm_types must be comma-separated numeric types");
+      const { cluster: k, device } = await locate(deviceID, cluster);
+      // Query with the deviceno VSS knows (locate() also accepts an IMEI suffix), as the web client does.
+      const deviceNo = String(device.deviceno ?? deviceID);
+      const res = await api(k, "/vss/alarm/findAllByTime.action", {
+        deviceGuid: deviceNo, deviceID: deviceNo, beginTime: start, endTime: end,
+        keyword: "", alarmType: alarm_types, pageNum: page, pageCount: page_size, takeType: ""
+      });
+      if (String(res.status) !== "10025") check(k, res, "alarm/findAllByTime");
+      const data = String(res.status) === "10025" ? { dataList: [], totalCount: 0 } : res.data;
+      if (!Array.isArray(data?.dataList)) throw new Error("unexpected Alarm Record response: dataList missing");
+      const alarms = data.dataList.map(row => ({
+        id: row.guid, deviceID: row.deviceguid ?? deviceID, alarm_type: row.alarmtype,
+        time: row.createtime, report_time: row.reportTime, end_time: row.endTime,
+        alarm_state: row.alarmState, detail: row.alarmvalue, end_detail: row.endDetail,
+        storage: storageAlarmText(row.alarmvalue)
+      }));
+      const total = Number(data.totalCount);
+      const total_count = Number.isInteger(total) && total >= 0 ? total : null;
+      const next_page = (total_count !== null ? page * page_size < total_count : alarms.length === page_size) ? page + 1 : null;
+      return { cluster: k, deviceID: deviceNo, plate: device.plateno || device.devicename, start, end, timezone: "UTC+7",
+        page, page_size, count: alarms.length, total_count, next_page, alarms,
+        note: "Historical alarms only; no conclusion about current fault or recovery. All types searched when alarm_types is empty." };
+    }
   },
   // ---------------- write tools (only listed when HOWEN_VSS_ALLOW_WRITE=1) ----------------
   {
