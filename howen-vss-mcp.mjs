@@ -16,7 +16,7 @@
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline";
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const PREFIX = "HOWEN_VSS";
 // CLUSTERS / ORDER are mutated in place on reload so tool schemas that reference ORDER stay current.
 const CLUSTERS = {};
@@ -380,8 +380,10 @@ const TOOLS = [
       if (!Number.isInteger(page) || page < 1 || !Number.isInteger(page_size) || page_size < 1 || page_size > 100) throw new Error("invalid pagination");
       if (typeof alarm_types !== "string" || (alarm_types && !/^\d+(,\d+)*$/.test(alarm_types))) throw new Error("alarm_types must be comma-separated numeric types");
       const { cluster: k, device } = await locate(deviceID, cluster);
+      // Query with the deviceno VSS knows (locate() also accepts an IMEI suffix), as the web client does.
+      const deviceNo = String(device.deviceno ?? deviceID);
       const res = await api(k, "/vss/alarm/findAllByTime.action", {
-        deviceGuid: deviceID, deviceID, beginTime: start, endTime: end,
+        deviceGuid: deviceNo, deviceID: deviceNo, beginTime: start, endTime: end,
         keyword: "", alarmType: alarm_types, pageNum: page, pageCount: page_size, takeType: ""
       });
       if (String(res.status) !== "10025") check(k, res, "alarm/findAllByTime");
@@ -396,7 +398,7 @@ const TOOLS = [
       const total = Number(data.totalCount);
       const total_count = Number.isInteger(total) && total >= 0 ? total : null;
       const next_page = (total_count !== null ? page * page_size < total_count : alarms.length === page_size) ? page + 1 : null;
-      return { cluster: k, deviceID, plate: device.plateno || device.devicename, start, end, timezone: "UTC+7",
+      return { cluster: k, deviceID: deviceNo, plate: device.plateno || device.devicename, start, end, timezone: "UTC+7",
         page, page_size, count: alarms.length, total_count, next_page, alarms,
         note: "Historical alarms only; no conclusion about current fault or recovery. All types searched when alarm_types is empty." };
     }
