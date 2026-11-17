@@ -11,10 +11,11 @@
 //   MEITRACK_MS03_TZ_MINUTES  local time zone offset for inputs/outputs (default 420 = UTC+7)
 //   MEITRACK_MS03_ALLOW_WRITE=1   exposes ms03_add_device (default: read-only)
 //   MEITRACK_MS03_TIMEOUT_MS      per-request timeout (default 20000)
+//   MEITRACK_MS03_SCAN_TIMEOUT_MS per-request timeout of ms03_storage_alarm_scan (default 60000)
 
 import { createInterface } from "node:readline";
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const PREFIX = "MEITRACK_MS03";
 const CLUSTERS = {};
 const ORDER = []; // mutated in place so tool schemas referencing it stay current
@@ -26,6 +27,7 @@ const DB_URI = env.MEITRACK_MS03_DB_URI || env.HOWEN_VSS_DB_URI || env.PLUS_DATA
 const DB_REFRESH_MS = Number(env.MEITRACK_MS03_DB_REFRESH_MS || 600000);
 const TZ_MIN = Number(env.MEITRACK_MS03_TZ_MINUTES || 420); // default Asia/Bangkok
 const SD_TIMEOUT = Number(env.MEITRACK_MS03_SD_TIMEOUT_MS || 90000);
+const SCAN_TIMEOUT = Number(env.MEITRACK_MS03_SCAN_TIMEOUT_MS || 60000);
 
 const hostKey = (host) => host.split(".")[0].toLowerCase().replace(/[^a-z0-9_-]/g, "") || "ms03";
 const envPrefix = (key) => `${PREFIX}_${key.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
@@ -270,6 +272,99 @@ export const gmt = (d) => d.toISOString().replace("T", " ").slice(0, 19); // YYY
 export const compactLocal = (d) => new Date(d.getTime() + TZ_MIN * 60000).toISOString().replace(/[-:TZ]/g, "").slice(2, 14); // YYMMDDHHMMSS local
 const ONLINE = { "-1": "offline", 0: "online (GPRS)", 1: "online (GSM)", 2: "online (Wi-Fi)", 3: "online (LAN)" };
 
+// ---------------- Fleet-wide alarm scan ----------------
+// HistoryAlarm accepts many comma-separated IMEIs. The server answers HTTP 404 once the URL passes ~2 KB
+// (150 IMEIs fail, 100 pass), so batches are capped by count and by the length of the Imeis parameter.
+// `message` carries the total row count; rows come back in time order and page with StartIdx/Limit.
+export const SCAN_MAX_IMEI_CHARS = 1700;
+export function batchImeis(imeis, size = 50, maxChars = SCAN_MAX_IMEI_CHARS) {
+  const out = [];
+  let cur = [], len = 0;
+  for (const i of imeis) {
+    const add = String(i).length + (cur.length ? 1 : 0);
+    if (cur.length && (cur.length >= size || len + add > maxChars)) { out.push(cur); cur = []; len = 0; }
+    len += String(i).length + (cur.length ? 1 : 0);
+    cur.push(String(i));
+  }
+  if (cur.length) out.push(cur);
+  return out;
+}
+
+const gmtToLocal = (d) => new Date(d.getTime() + TZ_MIN * 60000).toISOString().replace("T", " ").slice(0, 19);
+const localOf = (s) => (s ? new Date(new Date(`${String(s).replace(" ", "T")}Z`).getTime() + TZ_MIN * 60000).toISOString().replace("T", " ").slice(0, 19) : null);
+// Fold raw HistoryAlarm rows into one summary per IMEI (counts per code, first/last local time, last position).
+export function summarizeAlarms(rows, acc = new Map()) {
+  for (const r of rows) {
+    const t = r?.tracker_location || {};
+    const imei = String(t.sn_imei_id ?? r?.imei ?? "");
+    if (!imei) continue;
+    const code = String(r.meitrackeventid ?? t.alarm_id ?? "?");
+    const when = localOf(t.r_datetime || t.gps_info?.l_datetime);
+    const e = acc.get(imei) || { imei, tracker_name: t.tracker_name ?? null, total: 0, counts: {}, first_local: when, last_local: when, last_location: null };
+    e.total++;
+    e.counts[code] = (e.counts[code] || 0) + 1;
+    if (when && (!e.first_local || when < e.first_local)) e.first_local = when;
+    if (when && (!e.last_local || when >= e.last_local)) {
+      e.last_local = when;
+      const g = t.gps_info;
+      if (t.tracker_name) e.tracker_name = t.tracker_name;
+      e.last_location = g ? { lat: g.latitude, lng: g.longitude, speed: g.speed, gps_valid: g.gps_valid, gps_time_local: localOf(g.l_datetime), address: g.address || undefined } : null;
+    }
+    acc.set(imei, e);
+  }
+  return acc;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Run one request with retries; the token refresh itself is handled inside api().
+async function withRetry(fn, tries = 3) {
+  let last;
+  for (let i = 0; i < tries; i++) {
+    try { return await fn(); } catch (e) { last = e; if (i < tries - 1) await sleep(1000 * (i + 1)); }
+  }
+  throw last;
+}
+
+// Scan one cluster. fetchPage(params) returns the raw HistoryAlarm response (injectable for tests).
+export async function scanCluster(k, imeis, { beginGMT, endGMT, alarmTypes, batchSize = 50, pageSize = 1000, concurrency = 3, tries = 3, maxPages = 200 }, fetchPage) {
+  const batches = batchImeis(imeis, batchSize);
+  const acc = new Map();
+  const failed = [];
+  let requests = 0, rows = 0, next = 0;
+  const one = async (b, idx) => {
+    const local = new Map();
+    let got = 0;
+    for (let page = 0, start = 0; page < maxPages; page++, start += pageSize) {
+      const p = { Imeis: b.join(","), BeginGMT: beginGMT, EndGMT: endGMT, StartIdx: start, Limit: pageSize, timeZoneMinutes: TZ_MIN };
+      if (alarmTypes) p.AlarmTypes = alarmTypes;
+      requests++;
+      const res = await withRetry(async () => value(k, await fetchPage(p), "HistoryAlarm"), tries);
+      const v = Array.isArray(res) ? res : [];
+      summarizeAlarms(v, local);
+      got += v.length;
+      if (v.length < pageSize) return { local, got, truncated: false };
+    }
+    return { local, got, truncated: true };
+  };
+  const worker = async () => {
+    while (next < batches.length) {
+      const idx = next++;
+      const b = batches[idx];
+      try {
+        const { local, got, truncated } = await one(b, idx);
+        rows += got;
+        for (const [imei, e] of local) acc.set(imei, e);
+        if (truncated) failed.push({ cluster: k, batch: idx, imeis: b, error: `stopped after ${maxPages} pages - narrow the time range` });
+      } catch (e) {
+        failed.push({ cluster: k, batch: idx, imeis: b, error: e.message });
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, batches.length)) }, worker));
+  failed.sort((a, b) => a.batch - b.batch);
+  return { batches: batches.length, requests, rows, devices: acc, failed };
+}
+
 const clusterProp = { type: "string", enum: ORDER, description: "MS03 cluster. Omit to search all configured clusters." };
 const imeiProp = { type: "string", description: "Device IMEI (sn_imei_id), 15 digits" };
 const timeProp = (d) => ({ type: "string", description: `${d} - local time, YYYY-MM-DD HH:mm:ss` });
@@ -340,6 +435,57 @@ const TOOLS = [
       if (alarm_types) p.AlarmTypes = alarm_types;
       const v = value(k, await api(k, "HistoryAlarm", p), "HistoryAlarm") || [];
       return { cluster: k, imei, count: v.length, alarms: v.map(withLocal) };
+    },
+  },
+  {
+    name: "ms03_storage_alarm_scan",
+    description: "Fleet-wide scan of storage alarms (default 608 storage failure, 609 storage full, 190 TF card lost) for EVERY device of one or all clusters, using batched HistoryAlarm calls. Returns one summary row per device that had alarms (counts per code, first/last local time, last position) plus totals and the batches/IMEIs that could not be scanned. Never returns raw events. Range up to 31 days.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        start: timeProp("Start"), end: timeProp("End"), cluster: clusterProp,
+        alarm_types: { type: "string", default: "608,609,190", description: "Comma-separated alarm codes" },
+        batch_size: { type: "integer", minimum: 1, maximum: 100, default: 50, description: "IMEIs per HistoryAlarm call (server rejects URLs over ~2 KB, ~100 IMEIs)" },
+        max_devices: { type: "integer", minimum: 1, maximum: 5000, default: 3000, description: "Max device rows returned (most alarms first); totals always cover all devices" },
+      },
+      required: ["start", "end"],
+    },
+    readOnly: true,
+    async run({ start, end, cluster, alarm_types = "608,609,190", batch_size = 50, max_devices = 3000 }) {
+      const b = parseLocal(start), e = parseLocal(end);
+      if (!(e > b)) throw new Error("end must be after start");
+      if (e - b > 31 * 86400000) throw new Error("range is limited to 31 days");
+      if (alarm_types && !/^\d+(,\d+)*$/.test(String(alarm_types).replace(/\s/g, ""))) throw new Error("alarm_types must be comma-separated numbers");
+      const types = alarm_types ? String(alarm_types).replace(/\s/g, "") : "";
+      const t0 = Date.now();
+      const perCluster = [], devices = [], failed = [];
+      const errors = await eachCluster(cluster, async (k) => {
+        const c0 = Date.now();
+        let list;
+        try { list = await withRetry(() => trackers(k)); } catch (err) { throw new Error(`cluster ${k}: device list failed - ${err.message}`); }
+        const names = new Map(list.map((d) => [String(d.sn_imei_id ?? d.imei), d.tracker_name]));
+        const imeis = [...names.keys()].filter(Boolean);
+        const r = await scanCluster(k, imeis, { beginGMT: gmt(b), endGMT: gmt(e), alarmTypes: types, batchSize: batch_size },
+          (p) => api(k, "HistoryAlarm", p, Math.max(TIMEOUT, SCAN_TIMEOUT)));
+        const failedImeis = r.failed.reduce((n, f) => n + f.imeis.length, 0);
+        for (const d of r.devices.values()) devices.push({ cluster: k, ...d, tracker_name: names.get(d.imei) ?? d.tracker_name });
+        failed.push(...r.failed);
+        perCluster.push({ cluster: k, devices_scanned: imeis.length - failedImeis, devices_with_alarms: r.devices.size, devices_failed: failedImeis, batches: r.batches, requests: r.requests, events: r.rows, seconds: Math.round((Date.now() - c0) / 100) / 10 });
+      });
+      devices.sort((x, y) => y.total - x.total || String(y.last_local).localeCompare(String(x.last_local)));
+      perCluster.sort((x, y) => x.cluster.localeCompare(y.cluster));
+      const sum = (f) => perCluster.reduce((n, c) => n + c[f], 0);
+      return {
+        range_local: { start: gmtToLocal(b), end: gmtToLocal(e) }, alarm_types: types || "all",
+        summary: {
+          clusters: perCluster.length, devices_scanned: sum("devices_scanned"), devices_with_alarms: devices.length,
+          devices_failed: sum("devices_failed"), events: sum("events"), batches: sum("batches"), requests: sum("requests"),
+          seconds: Math.round((Date.now() - t0) / 100) / 10, complete: !failed.length && !errors.length,
+        },
+        per_cluster: perCluster, cluster_errors: errors,
+        failed_batches: failed,
+        returned: Math.min(max_devices, devices.length), devices: devices.slice(0, max_devices),
+      };
     },
   },
   {
