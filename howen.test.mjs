@@ -68,3 +68,53 @@ test("login uses DB credentials; MD5 passwords are sent as-is, plain ones are ha
   const logins = seen.filter((s) => s.path.endsWith("apiLogin.action"));
   assert.deepEqual(logins.map((l) => l.body.password), [md5("secret"), md5("secret")]);
 });
+
+test("storage classification requires explicit alarm text, not telemetry status", () => {
+  assert.equal(m.storageAlarmText({ name: 'sd1', status: '1' }), null);
+  assert.equal(m.storageAlarmText('satellites:22; st:7'), null);
+  assert.deepEqual(m.storageAlarmText('NO:sd1 ; State:L3_Disk invalid block: Judge the video partition ; satellites:22'), {
+    medium: 'sd1', level: 'L3', description: 'Disk invalid block: Judge the video partition', st: 7,
+    recording_impact: 'Not established by this alarm text; verify recorded files.'
+  });
+});
+
+test("alarm history sends the web-client query, paginates, handles no data and errors", async () => {
+  let mode = 'data'; const seen = [];
+  const srv = http.createServer((req, res) => {
+    let body = ''; req.on('data', d => body += d); req.on('end', () => {
+      const b = JSON.parse(body); seen.push({path:req.url, body:b});
+      res.setHeader('Content-Type', 'application/json');
+      if (req.url.endsWith('apiLogin.action')) return res.end(JSON.stringify({status:10000,data:{token:'alarm-test-token'}}));
+      if (req.url.endsWith('findAll.action')) return res.end(JSON.stringify({status:10000,data:{dataList:[{deviceno:'847053273528',devicename:'test plate'}]}}));
+      if (mode === 'empty') return res.end(JSON.stringify({status:10025,msg:'No Data'}));
+      if (mode === 'error') return res.end(JSON.stringify({status:10129,msg:'Requests too frequent'}));
+      res.end(JSON.stringify({status:10000,data:{totalCount:2,dataList:[{guid:'a1',deviceguid:'847053273528',alarmtype:99,createtime:'2026-11-17 09:00:00',alarmvalue:'NO:sd1 ; State:L3_Disk invalid block: Judge the video partition ; satellites:22',drivername:'private driver',takeupuser:'private operator'}]}}));
+    });
+  });
+  await new Promise(r => srv.listen(0, '127.0.0.1', r));
+  await m.loadClusters(true, async () => [{name:'Test',serverUrl:`http://127.0.0.1:${srv.address().port}`,username:'tester',password:'secret'}]);
+  const out = [], orig = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (s,...a) => { if (String(s).startsWith('{"jsonrpc"')) {out.push(JSON.parse(s));return true;} return orig(s,...a); };
+  const args = {deviceID:'847053273528',cluster:'127',start:'2026-11-17 00:00:00',end:'2026-11-17 23:59:59',page_size:1};
+  const call = async (arguments_ = args) => {
+    await m.handle({id:40,method:'tools/call',params:{name:'vss_alarm_history',arguments:arguments_}});
+    return out.at(-1).result;
+  };
+  try {
+    await m.handle({id:39,method:'tools/list'});
+    assert.equal(out.at(-1).result.tools.find(t=>t.name==='vss_alarm_history').annotations.readOnlyHint,true);
+    let r = await call(), data = JSON.parse(r.content[0].text);
+    assert.equal(data.next_page,2); assert.equal(data.total_count,2);
+    assert.equal(data.alarms[0].storage.level,'L3');
+    assert.ok(!JSON.stringify(data).includes('private'));
+    const request = seen.find(x=>x.path.endsWith('/alarm/findAllByTime.action'));
+    assert.equal(request.body.deviceGuid,args.deviceID); assert.equal(request.body.deviceID,args.deviceID);
+    assert.equal(request.body.beginTime,args.start); assert.equal(request.body.alarmType,'');
+    mode='empty'; data=JSON.parse((await call()).content[0].text);
+    assert.equal(data.count,0); assert.equal(data.next_page,null);
+    mode='error'; assert.equal((await call()).isError,true);
+    const count = seen.length;
+    for (const change of [{start:'2026-02-30 00:00:00'},{page:0},{page_size:101},{end:'2026-11-16 00:00:00'},{alarm_types:'1;delete'},{deviceID:''}]) assert.equal((await call({...args,...change})).isError,true);
+    assert.equal(seen.length,count,'invalid inputs must not reach the server');
+  } finally {process.stdout.write=orig; await new Promise(r=>srv.close(r));}
+});
