@@ -122,3 +122,14 @@ test("alarm history sends the web-client query, paginates, handles no data and e
     assert.equal(seen.length,count,'invalid inputs must not reach the server');
   } finally {process.stdout.write=orig; await new Promise(r=>srv.close(r));}
 });
+
+test("driver-card payload is redacted from alarm text", () => {
+  const raw = "Card No.:%  ^DOE$JOHN$MR.^^?\r\n;6007640000000000000=290101900101=?\r\n+   24   1   0000001  20300   ?\r\n$0$I\r ; Data Type:0 ; it:RFID ; Card Type:Driver card ; Type:In ; satellites:22";
+  const out = m.redactAlarmText(raw);
+  assert.equal(out, "Card No.:[redacted] ; Data Type:0 ; it:RFID ; Card Type:Driver card ; Type:In ; satellites:22");
+  assert.ok(!/DOE|JOHN|6007640000000000000/.test(out));
+  assert.equal(m.redactAlarmText("Card No.:%^DOE$JOHN^?"), "Card No.:[redacted]");
+  const storage = "NO:sd1 ; State:L3_Disk invalid block: Judge the video partition ; satellites:22";
+  assert.equal(m.redactAlarmText(storage), storage);
+  assert.equal(m.redactAlarmText(null), null);
+});

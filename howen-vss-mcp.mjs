@@ -16,7 +16,7 @@
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline";
 
-const VERSION = "0.5.0";
+const VERSION = "0.5.1";
 const PREFIX = "HOWEN_VSS";
 // CLUSTERS / ORDER are mutated in place on reload so tool schemas that reference ORDER stay current.
 const CLUSTERS = {};
@@ -232,6 +232,13 @@ async function locate(deviceID, cluster) {
 // Alarm Record fields and endpoint verified against the deployed VSS web client.
 // Only an explicit NO:<medium>; State:Lx_... alarm text supplies a storage level.
 // Telemetry storage.status and unrelated numeric st fields are never classified.
+// Driver-card (RFID/IC) alarms carry the raw card track in alarmvalue: holder name, licence
+// number and birth date. Keep the rest of the text but never return the card payload.
+export function redactAlarmText(value) {
+  if (typeof value !== "string") return value ?? null;
+  return value.replace(/Card No\.:[\s\S]*?(?= ; |$)/gi, "Card No.:[redacted]");
+}
+
 export function storageAlarmText(value) {
   if (typeof value !== "string") return null;
   const match = value.match(/NO:\s*((?:sd|hdd)\d+)\s*;\s*State:\s*(L[123])[_\s]+([^;]+)/i);
@@ -392,7 +399,7 @@ const TOOLS = [
       const alarms = data.dataList.map(row => ({
         id: row.guid, deviceID: row.deviceguid ?? deviceID, alarm_type: row.alarmtype,
         time: row.createtime, report_time: row.reportTime, end_time: row.endTime,
-        alarm_state: row.alarmState, detail: row.alarmvalue, end_detail: row.endDetail,
+        alarm_state: row.alarmState, detail: redactAlarmText(row.alarmvalue), end_detail: redactAlarmText(row.endDetail),
         storage: storageAlarmText(row.alarmvalue)
       }));
       const total = Number(data.totalCount);

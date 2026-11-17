@@ -160,7 +160,9 @@ Other descriptions retain their text and level without guessing a numeric status
 Telemetry `storage.status` is not classified as an alarm code. L1/L2/L3 do not by
 themselves establish recording loss; check recorded files separately. Historical alarms
 also do not establish whether a fault is still active or has recovered.
-Driver and operator identity fields are excluded from the selected output fields.
+Driver and operator identity fields are excluded from the selected output fields, and the
+driver-card payload in `Card No.:` alarm text (name, licence number, birth date) is replaced
+with `[redacted]`.
 
 This tool only reads history; it does not acknowledge alarms, format cards or alter devices.
 Local tests use a fake server. A deployment must additionally verify the response shape
