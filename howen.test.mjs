@@ -122,3 +122,69 @@ test("alarm history sends the web-client query, paginates, handles no data and e
     assert.equal(seen.length,count,'invalid inputs must not reach the server');
   } finally {process.stdout.write=orig; await new Promise(r=>srv.close(r));}
 });
+
+test("evidence helpers: alarm types, envelopes, field mapping", () => {
+  assert.deepEqual(m.evidenceAlarmTypes(undefined), []);
+  assert.deepEqual(m.evidenceAlarmTypes([61, "62"]), [61, 62]);
+  assert.deepEqual(m.evidenceAlarmTypes("61, 62"), [61, 62]);
+  assert.throws(() => m.evidenceAlarmTypes(["1;drop"]));
+  assert.throws(() => m.evidenceAlarmTypes([-1]));
+  assert.deepEqual(m.evidenceRows([{ a: 1 }]), { rows: [{ a: 1 }], total_count: null });
+  assert.deepEqual(m.evidenceRows({ dataList: [], totalCount: "3" }), { rows: [], total_count: 3 });
+  assert.deepEqual(m.evidenceRows({ dataList: [] }), { rows: [], total_count: null });
+  assert.throws(() => m.evidenceRows({ list: [] }), /unexpected Evidence response/);
+  assert.throws(() => m.evidenceRows(null), /unexpected Evidence response/);
+  const f = m.evidenceFile({ alarmGuid: "A1", guid: "G1", deviceID: "1", fileType: 2, channel: 3, fileStartTime: "s", fileStopTime: "e", downUrl: "https://x/v.mp4" });
+  assert.equal(f.file_type_name, "alarm video"); assert.equal(f.down_url, "https://x/v.mp4"); assert.equal(f.alarm_guid, "A1");
+  assert.equal(m.evidenceFile({ downUrl: "" }).down_url, null);
+});
+
+test("evidence files sends the 3.24 query, paginates, handles no data, errors and bad envelopes", async () => {
+  let mode = "data"; const seen = [];
+  const file = { deviceID: "430062045923", alarmType: 61, alarmGuid: "17949839000310320000430062045923", fileType: 2, channel: 1,
+    filePath: "/evidence/a.mp4", fileStartTime: "2026-11-18 06:38:10", fileStopTime: "2026-11-18 06:38:30", downUrl: "https://vss.example/down/a.mp4", guid: "g1" };
+  const srv = http.createServer((req, res) => {
+    let body = ""; req.on("data", d => body += d); req.on("end", () => {
+      const b = JSON.parse(body); seen.push({ path: req.url, body: b });
+      res.setHeader("Content-Type", "application/json");
+      if (req.url.endsWith("apiLogin.action")) return res.end(JSON.stringify({ status: 10000, data: { token: "ev-token" } }));
+      if (req.url.endsWith("findAll.action")) return res.end(JSON.stringify({ status: 10000, data: { dataList: [{ deviceno: "430062045923", imei: "86430062045923", plateno: "72-0382" }] } }));
+      if (mode === "empty") return res.end(JSON.stringify({ status: 10025, msg: "No Data" }));
+      if (mode === "error") return res.end(JSON.stringify({ status: 10129, msg: "Requests too frequent" }));
+      if (mode === "weird") return res.end(JSON.stringify({ status: 10000, data: { rows: [file] } }));
+      if (mode === "array") return res.end(JSON.stringify({ status: 10000, data: [file] }));
+      res.end(JSON.stringify({ status: 10000, data: { totalCount: 2, dataList: [file] } }));
+    });
+  });
+  await new Promise(r => srv.listen(0, "127.0.0.1", r));
+  await m.loadClusters(true, async () => [{ name: "Test", serverUrl: `http://127.0.0.1:${srv.address().port}`, username: "tester", password: "secret" }]);
+  const out = [], orig = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (s, ...a) => { if (String(s).startsWith('{"jsonrpc"')) { out.push(JSON.parse(s)); return true; } return orig(s, ...a); };
+  const args = { deviceID: "430062045923", cluster: "127", start: "2026-11-18 06:37:00", end: "2026-11-18 06:40:00", alarm_types: [61], page: 1, page_size: 1 };
+  const call = async (a = args) => { await m.handle({ id: 50, method: "tools/call", params: { name: "vss_evidence_files", arguments: a } }); return out.at(-1).result; };
+  try {
+    await m.handle({ id: 49, method: "tools/list" });
+    const t = out.at(-1).result.tools.find(x => x.name === "vss_evidence_files");
+    assert.ok(t, "tool listed without write mode"); assert.equal(t.annotations.readOnlyHint, true);
+    let data = JSON.parse((await call()).content[0].text);
+    assert.equal(data.count, 1); assert.equal(data.total_count, 2); assert.equal(data.next_page, 2);
+    assert.equal(data.files[0].alarm_guid, file.alarmGuid); assert.equal(data.files[0].down_url, file.downUrl);
+    assert.equal(data.plate, "72-0382");
+    const { token: _t, ...q } = seen.filter(x => x.path.endsWith("/vss/record/findRecords.action")).at(-1).body;
+    assert.ok(_t, "token sent");
+    assert.deepEqual(q, { pageNum: 1, pageSize: 1, beginTime: args.start, endTime: args.end, deviceIdList: ["430062045923"], alarmTypeList: [61] });
+    data = JSON.parse((await call({ ...args, alarm_types: undefined, page_size: 50 })).content[0].text);
+    assert.equal(data.next_page, null);
+    assert.ok(!("alarmTypeList" in seen.filter(x => x.path.endsWith("/findRecords.action")).at(-1).body));
+    mode = "array"; data = JSON.parse((await call()).content[0].text);
+    assert.equal(data.total_count, null); assert.equal(data.next_page, 2, "full page without total -> try next page");
+    mode = "empty"; data = JSON.parse((await call()).content[0].text);
+    assert.equal(data.count, 0); assert.equal(data.next_page, null);
+    mode = "error"; assert.equal((await call()).isError, true);
+    mode = "weird"; const w = await call(); assert.equal(w.isError, true); assert.match(w.content[0].text, /unexpected Evidence response/);
+    const count = seen.length;
+    for (const change of [{ start: "2026-02-30 00:00:00" }, { page: 0 }, { page_size: 101 }, { end: "2026-11-17 00:00:00" }, { alarm_types: ["61;x"] }, { deviceID: "" }, { deviceID: "1,2" }])
+      assert.equal((await call({ ...args, ...change })).isError, true, JSON.stringify(change));
+    assert.equal(seen.length, count, "invalid inputs must not reach the server");
+  } finally { process.stdout.write = orig; await new Promise(r => srv.close(r)); }
+});
