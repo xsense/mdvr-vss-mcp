@@ -16,7 +16,7 @@
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline";
 
-const VERSION = "0.5.0";
+const VERSION = "0.6.0";
 const PREFIX = "HOWEN_VSS";
 // CLUSTERS / ORDER are mutated in place on reload so tool schemas that reference ORDER stay current.
 const CLUSTERS = {};
@@ -254,6 +254,36 @@ function alarmRange(start, end) {
   if (a > b || b - a > 31 * 86400000) throw new Error("start must be <= end and range must be at most 31 days");
 }
 
+// Alarm Evidence Search (Howen VSS Web API V2.8.0R1, section 3.24). Pure helpers exported for tests.
+export function evidenceAlarmTypes(value) {
+  if (value === undefined || value === null || value === "") return [];
+  const list = typeof value === "string" ? value.split(",").map((s) => s.trim()) : value;
+  if (!Array.isArray(list) || list.length > 50 || !list.every((t) => /^\d+$/.test(String(t)))) throw new Error("alarm_types must be a list of numeric alarm types");
+  return list.map(Number);
+}
+// Accept only the documented shapes (data array, or data.dataList with optional totalCount); anything else is an error,
+// so an unknown envelope is never reported as "no files".
+export function evidenceRows(data) {
+  if (Array.isArray(data)) return { rows: data, total_count: null };
+  if (data && Array.isArray(data.dataList)) {
+    const raw = data.totalCount ?? data.total;
+    const total = raw === undefined || raw === null || raw === "" ? NaN : Number(raw);
+    return { rows: data.dataList, total_count: Number.isInteger(total) && total >= 0 ? total : null };
+  }
+  throw new Error("unexpected Evidence response: expected data array or data.dataList");
+}
+const FILE_TYPES = { 1: "normal video", 2: "alarm video", 3: "normal image", 4: "alarm image" };
+export function evidenceFile(r) {
+  return {
+    alarm_guid: r.alarmGuid ?? null, guid: r.guid ?? null, deviceID: r.deviceID ?? null, device_name: r.deviceName ?? null,
+    fleet_name: r.fleetName ?? null, alarm_type: r.alarmType ?? null, io_name: r.ioName ?? null,
+    file_type: r.fileType ?? null, file_type_name: FILE_TYPES[r.fileType] ?? null, channel: r.channel ?? null,
+    start_time: r.fileStartTime ?? null, stop_time: r.fileStopTime ?? null,
+    file_path: r.filePath ?? null, thumbnail: r.fileThumbnail ?? null, down_url: r.downUrl || null,
+    down_task_type: r.downTaskType ?? null, down_datetime: r.downDatetime ?? null,
+  };
+}
+
 const clusterProp = { type: "string", enum: ORDER, description: "VSS cluster. Omit to search all configured clusters." };
 const devProp = { type: "string", description: "Howen device number (deviceno), e.g. 001234567890" };
 
@@ -401,6 +431,37 @@ const TOOLS = [
       return { cluster: k, deviceID: deviceNo, plate: device.plateno || device.devicename, start, end, timezone: "UTC+7",
         page, page_size, count: alarms.length, total_count, next_page, alarms,
         note: "Historical alarms only; no conclusion about current fault or recovery. All types searched when alarm_types is empty." };
+    }
+  },
+  {
+    name: "vss_evidence_files",
+    description: "Read Alarm Evidence files (Howen API 3.24 record/findRecords): alarm video/image metadata per alarm (alarmGuid), channel, file times and the downUrl the server returns. Times are UTC+7. Returns one bounded page; follow next_page until null before concluding a search is complete. Read-only: does not create upload/download tasks or change devices or evidence.",
+    inputSchema: { type: "object", properties: {
+      deviceID: devProp, cluster: clusterProp,
+      start: { type: "string", description: "Start UTC+7, YYYY-MM-DD HH:mm:ss" },
+      end: { type: "string", description: "End UTC+7, YYYY-MM-DD HH:mm:ss; maximum range 31 days" },
+      alarm_types: { type: "array", items: { type: "integer", minimum: 0 }, description: "Optional numeric VSS alarm types (e.g. [61]); omit for all types" },
+      page: { type: "integer", minimum: 1, default: 1 },
+      page_size: { type: "integer", minimum: 1, maximum: 100, default: 50 }
+    }, required: ["deviceID", "start", "end"] },
+    readOnly: true,
+    async run({ deviceID, cluster, start, end, alarm_types = [], page = 1, page_size = 50 }) {
+      if (typeof deviceID !== "string" || !/^\d+$/.test(deviceID)) throw new Error("deviceID must be one numeric device number");
+      alarmRange(start, end);
+      if (!Number.isInteger(page) || page < 1 || !Number.isInteger(page_size) || page_size < 1 || page_size > 100) throw new Error("invalid pagination");
+      const types = evidenceAlarmTypes(alarm_types);
+      const { cluster: k, device } = await locate(deviceID, cluster);
+      const deviceNo = String(device.deviceno ?? deviceID);
+      const body = { pageNum: page, pageSize: page_size, beginTime: start, endTime: end, deviceIdList: [deviceNo] };
+      if (types.length) body.alarmTypeList = types;
+      const res = await api(k, "/vss/record/findRecords.action", body);
+      if (String(res.status) !== "10025") check(k, res, "record/findRecords");
+      const { rows, total_count } = evidenceRows(String(res.status) === "10025" ? [] : res.data);
+      const files = rows.map(evidenceFile);
+      const next_page = (total_count !== null ? page * page_size < total_count : files.length === page_size) ? page + 1 : null;
+      return { cluster: k, deviceID: deviceNo, plate: device.plateno || device.devicename, start, end, timezone: "UTC+7",
+        alarm_types: types, page, page_size, count: files.length, total_count, next_page, files,
+        note: "Match files to an alarm by alarm_guid. Use only down_url returned by the server; it may need the VSS session or be unavailable until the evidence upload finishes." };
     }
   },
   // ---------------- write tools (only listed when HOWEN_VSS_ALLOW_WRITE=1) ----------------

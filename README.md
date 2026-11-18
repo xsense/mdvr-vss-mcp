@@ -89,6 +89,7 @@ Read tools:
 - `vss_find_device`
 - `vss_device_status`
 - `vss_alarm_history`: bounded Alarm Record history, with explicit storage alarm levels when present.
+- `vss_evidence_files`: Alarm Evidence files (video/image metadata and server `downUrl`) for one device and time range, filterable by alarm type, paged with `next_page`. Read-only; never creates download tasks.
 - `vss_get_device_setting`
 
 Write tools (only when `HOWEN_VSS_ALLOW_WRITE=1`, each call needs `confirm=true`):
