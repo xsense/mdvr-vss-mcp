@@ -111,6 +111,7 @@ Write tools read the current values first, change only the requested fields, and
 | `MEITRACK_MS03_TZ_MINUTES` | local time zone offset for tool inputs and outputs, default 420 (UTC+7) |
 | `MEITRACK_MS03_TIMEOUT_MS` | request timeout, default 20000 |
 | `MEITRACK_MS03_SD_TIMEOUT_MS` | timeout for SD card and FTP file lists, default 90000 |
+| `MEITRACK_MS03_SCAN_TIMEOUT_MS` | per-request timeout of `ms03_storage_alarm_scan`, default 60000 |
 | `MEITRACK_MS03_ALLOW_WRITE` | `1` exposes `ms03_add_device` |
 
 Times passed to and returned by the tools are local, `YYYY-MM-DD HH:mm:ss`. The API itself uses GMT, and responses gain `time_local` / `gps_time_local` fields.
@@ -120,6 +121,7 @@ Read tools:
 - `ms03_find_device`: searches by IMEI, name, SIM or firmware.
 - `ms03_device_status`: returns online mode and last received time, plus the latest GPS point.
 - `ms03_alarm_history`: alarm history, optionally filtered by alarm codes.
+- `ms03_storage_alarm_scan`: scans every device of one or all clusters for storage alarms (default `608,609,190`) in one call. See below.
 - `ms03_video_files`: lists files on the device SD card or on FTP (with MP4 URLs). It returns a summary for each channel, then the newest `limit` files (default 50).
 
 Write tool (only when `MEITRACK_MS03_ALLOW_WRITE=1`, needs `confirm=true`):
@@ -166,3 +168,35 @@ Driver and operator identity fields are excluded from the selected output fields
 This tool only reads history; it does not acknowledge alarms, format cards or alter devices.
 Local tests use a fake server. A deployment must additionally verify the response shape
 and an actual alarm on the target VSS version before claiming live verification.
+
+## Meitrack fleet storage alarm scan
+
+`ms03_storage_alarm_scan` reads the device list of each cluster (`Tracker`, cached 5 minutes), splits the IMEIs
+into batches and calls `HistoryAlarm` with comma-separated `Imeis`, paging with `StartIdx`/`Limit` (1000) until a page is short.
+
+```json
+{"start":"2026-11-10 00:00:00","end":"2026-11-17 00:00:00","alarm_types":"608,609,190"}
+```
+
+- `cluster` limits the scan to one cluster; omit it to scan all of them in parallel.
+- `batch_size` (default 50, max 100). The MS03 server answers HTTP 404 when the URL is longer than about 2 KB
+  (150 IMEIs failed and 100 passed on 2026-11-17), so a batch is also capped at 1700 characters of IMEIs.
+- Each request is retried 3 times. Expired tokens and used-up token quotas trigger a new login.
+  A batch that still fails is listed in `failed_batches` with its IMEIs and the error, and `summary.complete` is `false`.
+- The range is limited to 31 days.
+- The output has one row per device with alarms: `cluster`, `imei`, `tracker_name`, `total`, `counts` per code,
+  `first_local`/`last_local` (local time) and `last_location`. It also includes `summary` and `per_cluster`
+  (devices scanned / with alarms / failed, batches, requests, events, seconds). Raw events are never returned.
+  Devices are sorted by alarm count and capped by `max_devices` (default 3000); the totals always cover every device.
+
+Live test on 2026-11-17 (4 clusters, 2026-11-10 00:00 to 2026-11-17 00:00, codes 608,609,190):
+
+| Cluster | Devices | Batches | Requests | With alarms | Events | Seconds |
+|---|---|---|---|---|---|---|
+| b | 561 | 12 | 17 | 18 | 5958 | 1.2 |
+| c | 403 | 9 | 9 | 8 | 998 | 0.9 |
+| camtruck | 483 | 10 | 10 | 24 | 731 | 2.0 |
+| d | 942 | 19 | 20 | 52 | 1459 | 3.2 |
+| **all** | **2389** | **50** | **56** | **102** | **9146** | **3.3** (wall clock, clusters in parallel) |
+
+With batch sizes 10 and 100 the totals were the same. For two devices, the per-device counts matched single-IMEI `HistoryAlarm` totals.

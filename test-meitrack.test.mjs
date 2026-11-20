@@ -98,3 +98,49 @@ test("fileResult summarizes per channel and returns the newest files up to limit
   assert.equal(r.files[0].begin_local, "2026-11-16 09:59:00");
   assert.equal(m.fromCompact("261116095953"), "2026-11-16 09:59:53");
 });
+
+test("batchImeis caps batches by count and by Imeis parameter length", () => {
+  const imeis = Array.from({ length: 250 }, (_, i) => String(860000000000000 + i));
+  const b = m.batchImeis(imeis, 50);
+  assert.equal(b.length, 5);
+  assert.deepEqual(b.flat(), imeis);
+  const big = m.batchImeis(imeis, 1000);
+  assert.ok(big.every((x) => x.join(",").length <= m.SCAN_MAX_IMEI_CHARS));
+  assert.equal(big[0].length, 106); // 1700 chars / 16 per IMEI
+});
+
+test("summarizeAlarms counts per code, keeps first/last local time and last position", () => {
+  const row = (imei, code, t, lat) => ({ meitrackeventid: code, tracker_location: { sn_imei_id: imei, tracker_name: `T-${imei}`, r_datetime: t, gps_info: { latitude: lat, longitude: 100, speed: 0, gps_valid: true, l_datetime: t } } });
+  const acc = m.summarizeAlarms([row("1", 608, "2026-11-10T17:00:00", 1), row("1", 609, "2026-11-11T01:00:00", 2), row("1", 608, "2026-11-10T18:00:00", 3), row("2", 190, "2026-11-12T00:00:00", 4)]);
+  const a = acc.get("1");
+  assert.deepEqual(a.counts, { 608: 2, 609: 1 });
+  assert.equal(a.total, 3);
+  assert.equal(a.first_local, "2026-11-11 00:00:00");
+  assert.equal(a.last_local, "2026-11-11 08:00:00");
+  assert.equal(a.last_location.lat, 2);
+  assert.equal(acc.get("2").tracker_name, "T-2");
+});
+
+test("scanCluster pages each batch, retries transient errors and reports failed batches", async () => {
+  const imeis = Array.from({ length: 7 }, (_, i) => String(i + 1));
+  const calls = [];
+  let flaky = 0;
+  const fetchPage = async (p) => {
+    calls.push(p);
+    const ids = p.Imeis.split(",");
+    if (ids.includes("7")) throw new Error("did not answer within the timeout"); // batch 2 always fails
+    if (ids.includes("4") && p.StartIdx === 0 && flaky++ === 0) throw new Error("socket hang up"); // once
+    const all = [];
+    for (const id of ids) for (let i = 0; i < 3; i++) all.push({ meitrackeventid: 608, tracker_location: { sn_imei_id: id, r_datetime: `2026-11-10T0${i}:00:00` } });
+    return { state: true, message: all.length, value: all.slice(p.StartIdx, p.StartIdx + p.Limit) };
+  };
+  const r = await m.scanCluster("b", imeis, { beginGMT: "x", endGMT: "y", alarmTypes: "608", batchSize: 3, pageSize: 4, tries: 2 }, fetchPage);
+  assert.equal(r.batches, 3);
+  assert.equal(r.devices.size, 6);
+  assert.equal(r.rows, 18);
+  assert.ok([...r.devices.values()].every((d) => d.total === 3));
+  assert.equal(r.failed.length, 1);
+  assert.deepEqual(r.failed[0].imeis, ["7"]);
+  assert.match(r.failed[0].error, /timeout/);
+  assert.ok(calls.every((c) => c.AlarmTypes === "608" && c.Limit === 4));
+});
